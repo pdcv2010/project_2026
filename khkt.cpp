@@ -1,600 +1,456 @@
 #include <iostream>
-#include <string>
-#include <vector>
 #include <fstream>
-#include <iomanip>
+#include <vector>
+#include <string>
 #include <algorithm>
-#include <cstdint>
-#include <aubio/aubio.h>
-#include "sha256.h"
-#include "aes.h"
-#include "hmac_sha256.h"
-#include <cstring>
 #include <filesystem>
+#include <cstring>
+#include <cstdint>
 #include <random>
-#include <cstdlib>
-#include <ctime>
-using namespace std; 
-vector<double> beattime;
-vector<double> beatIntervals;
-vector<unsigned char> generateHash(const string& pass)
-{
-    SHA256_CTX ctx;
-    vector<unsigned char> hash(32);
-    sha256_init(&ctx);
-    sha256_update(&ctx,(const unsigned char*)pass.c_str(),pass.size());
-    sha256_final(&ctx,hash.data());
+#include <set>
+#include <limits>
+#include <iomanip>
+#include <sstream>
+
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#include <aubio/aubio.h>
+
+namespace fs = std::filesystem;
+
+#pragma pack(push, 1)
+struct FileHeader {
+    uint32_t index;
+    uint32_t total;
+    uint64_t sessionId;
+    uint64_t payloadSize;
+};
+#pragma pack(pop)
+
+struct DecryptedFragment {
+    FileHeader header;
+    std::vector<uint8_t> payload;
+    std::string sourcePath;
+};
+
+std::vector<uint8_t> generateHash(const std::string& password) {
+    std::vector<uint8_t> hash(SHA256_DIGEST_LENGTH);
+    SHA256(reinterpret_cast<const unsigned char*>(password.data()), password.size(), hash.data());
     return hash;
 }
-vector<uint8_t> readFile(const string& path){
-    ifstream file(path, ios::binary);
-    if (!file){
-        cout << "Khong mo duoc file!\n";
-        return {};
-    }
-    file.seekg(0, ios::end);
-    size_t size =static_cast<size_t>(file.tellg());
-    file.seekg(0, ios::beg);
-    vector<uint8_t> data(size);
-    file.read(reinterpret_cast<char*>(data.data()),size);
-    file.close();
-    return data;
-}
-void writeFile(const string& path,const vector<uint8_t>& data){
-    ofstream file(path, ios::binary);
-    if (!file){
-        cout << "Khong tao duoc file!\n";
-        return;
-    }
-    file.write(reinterpret_cast<const char*>(data.data()),data.size());
-    file.close();
-}
-void aesEncrypt(vector<uint8_t>& data,const vector<unsigned char>& key){
-    AES_ctx ctx;
-    uint8_t iv[16] ={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
-    AES_init_ctx_iv(
-        &ctx,
-        key.data(),
-        iv
-    );
 
-    AES_CBC_encrypt_buffer(
-        &ctx,
-        data.data(),
-        data.size()
-    );
+std::string computeSHA256(const std::vector<uint8_t>& data) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(data.data(), data.size(), hash);
+    std::ostringstream ss;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+    }
+    return ss.str();
 }
 
-void aesDecrypt(
-    vector<uint8_t>& data,
-    const vector<unsigned char>& key
-)
-{
-    AES_ctx ctx;
-
-    uint8_t iv[16] =
-    {
-        0,1,2,3,4,5,6,7,
-        8,9,10,11,12,13,14,15
-    };
-
-    AES_init_ctx_iv(
-        &ctx,
-        key.data(),
-        iv
-    );
-
-    AES_CBC_decrypt_buffer(
-        &ctx,
-        data.data(),
-        data.size()
-    );
-}
-void apadd(vector<uint8_t>& data)
-{
-    uint8_t padd =
-        16 - (data.size() % 16);
-
-    for (int i = 0; i < padd; i++)
-    {
-        data.push_back(padd);
-    }
+uint64_t createsessionId() {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis;
+    return dis(gen);
 }
 
-void rpadd(vector<uint8_t>& data)
-{
-    if (data.empty())
-        return;
-
-    uint8_t padd =
-        data.back();
-
-    if (padd == 0 || padd > 16)
-        return;
-
-    if (padd > data.size())
-        return;
-
-    data.resize(
-        data.size() - padd
-    );
+std::string randomFileName() {
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, sizeof(alphabet) - 2);
+    std::string name = "";
+    for (int i = 0; i < 16; ++i) {
+        name += alphabet[dis(gen)];
+    }
+    return name + ".sgt";
 }
-bool analyzeBeat(const string& audioPath)
-{
-    beattime.clear();
-    beatIntervals.clear();
 
-    uint_t hop_size = 512;
-    uint_t buffer_size = 1024;
+std::vector<uint8_t> readFile(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return {};
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buffer(size);
+    if (file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        return buffer;
+    }
+    return {};
+}
 
-    aubio_source_t* source =
-        new_aubio_source(
-            audioPath.c_str(),
-            0,
-            hop_size
-        );
+bool writeFile(const std::string& path, const std::vector<uint8_t>& data) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file.is_open()) return false;
+    file.write(reinterpret_cast<const char*>(data.data()), data.size());
+    file.flush();
+    return file.good();
+}
 
-    if (!source)
-    {
-        cout << "Khong mo duoc file am thanh!\n";
-        return false;
+std::vector<double> analyzeBeat(const std::string& audioPath) {
+    std::vector<double> beats;
+    uint_t win_s = 1024;
+    uint_t hop_s = 512;
+    uint_t samplerate = 44100;
+
+    aubio_source_t* source = new_aubio_source(audioPath.c_str(), samplerate, hop_s);
+    if (!source) {
+        beats.push_back(0.5);
+        beats.push_back(1.0);
+        return beats;
     }
 
-    uint_t sample_rate =
-        aubio_source_get_samplerate(source);
-
-    cout << "Sample rate: "
-         << sample_rate
-         << " Hz\n";
-
-    if (sample_rate == 0)
-    {
-        del_aubio_source(source);
-        return false;
-    }
-
-    aubio_tempo_t* tempo =
-        new_aubio_tempo(
-            "default",
-            buffer_size,
-            hop_size,
-            sample_rate
-        );
-
-    if (!tempo)
-    {
-        del_aubio_source(source);
-        return false;
-    }
-
-    fvec_t* samples =
-        new_fvec(hop_size);
-
-    fvec_t* beat =
-        new_fvec(1);
-
-    if (!samples || !beat)
-    {
-        if (samples)
-            del_fvec(samples);
-
-        if (beat)
-            del_fvec(beat);
-
-        del_aubio_tempo(tempo);
-        del_aubio_source(source);
-
-        return false;
-    }
+    fvec_t* in = new_fvec(hop_s);
+    aubio_tempo_t* tempo = new_aubio_tempo("default", win_s, hop_s, samplerate);
+    fvec_t* out = new_fvec(2);
 
     uint_t read = 0;
-    do
-    {
-        aubio_source_do(
-            source,
-            samples,
-            &read
-        );
-
-        aubio_tempo_do(
-            tempo,
-            samples,
-            beat
-        );
-
-        if (beat->data[0] != 0)
-        {
-            double time =
-                aubio_tempo_get_last(tempo);
-
-            beattime.push_back(time);
+    uint_t total_frames = 0;
+    while (true) {
+        aubio_source_do(source, in, &read);
+        aubio_tempo_do(tempo, in, out);
+        if (out->data[0] != 0) {
+            double last_beat = aubio_tempo_get_last_s(tempo);
+            beats.push_back(last_beat);
         }
-
-    } while (read > 0);
-
-    for (size_t i = 1;
-         i < beattime.size();
-         i++)
-    {
-        double interval =
-            beattime[i] -
-            beattime[i - 1];
-
-        if (interval > 0)
-        {
-            beatIntervals.push_back(interval);
-        }
+        total_frames += read;
+        if (read < hop_s) break;
     }
 
-    del_fvec(samples);
-    del_fvec(beat);
     del_aubio_tempo(tempo);
     del_aubio_source(source);
+    del_fvec(in);
+    del_fvec(out);
 
-    cout << "\nBEAT MAP\n";
-    cout << "So Beat: "
-         << beattime.size()
-         << "\n";
-
-    cout << "So Beat Interval: "
-         << beatIntervals.size()
-         << "\n";
-
-    return !beatIntervals.empty();
+    if (beats.empty()) beats.push_back(0.5);
+    return beats;
 }
 
-vector<size_t> createFragmentMap(size_t dataSize, const vector<unsigned char>& secretKey) {
-    vector<size_t> fragmentSizes;
-    if (dataSize < 16 || beatIntervals.empty()) return fragmentSizes;
-    size_t fragmentCount = min(beatIntervals.size(), dataSize / 16);
-    if (fragmentCount == 0) return fragmentSizes;
-    vector<uint64_t> weights;
-    uint64_t totalWeight = 0;
-    for (size_t i = 0; i < fragmentCount; i++) {
-        vector<uint8_t> input;
-        string domain = "SENTINELGATE-FRAGMENT-MAP-V1";
-        input.insert(input.end(), domain.begin(), domain.end());
-        uint64_t intervalBits = 0;
-        memcpy(&intervalBits, &beatIntervals[i], sizeof(double));
-        for (int b = 0; b < 8; b++) input.push_back((intervalBits >> (b * 8)) & 0xFF);
-        uint64_t index = i;
-        for (int b = 0; b < 8; b++) input.push_back((index >> (b * 8)) & 0xFF);
-        unsigned char digest[32];
-        hmac_sha256(secretKey.data(), secretKey.size(), input.data(), input.size(), digest, sizeof(digest));
-        uint64_t weight = 0;
-        for (int b = 0; b < 8; b++) weight = (weight << 8) | digest[b];
-        weight = (weight % 1000000ULL) + 1;
-        weights.push_back(weight);
-        totalWeight += weight;
-    }
-    size_t remaining = dataSize;
-    for (size_t i = 0; i < fragmentCount; i++) {
-        size_t fragmentsLeft = fragmentCount - i;
-        size_t minimumRemaining = (fragmentsLeft - 1) * 16;
-        size_t available = remaining - minimumRemaining;
-        size_t fragmentSize;
-        if (i == fragmentCount - 1) {
-            fragmentSize = available;
-        } else {
-            fragmentSize = static_cast<size_t>((static_cast<long double>(available) * weights[i]) / totalWeight);
-            fragmentSize = (fragmentSize / 16) * 16;
-            if (fragmentSize < 16) fragmentSize = 16;
+std::vector<size_t> createFragmentMap(size_t fileSize, const std::vector<double>& beats) {
+    std::vector<size_t> sizes;
+    if (fileSize == 0) return sizes;
+
+    size_t numFragments = beats.size();
+    if (numFragments == 0) numFragments = 4;
+
+    size_t baseSize = fileSize / numFragments;
+    size_t remainder = fileSize % numFragments;
+
+    for (size_t i = 0; i < numFragments; ++i) {
+        size_t currentSize = baseSize + (i == numFragments - 1 ? remainder : 0);
+        if (currentSize > 0) {
+            sizes.push_back(currentSize);
         }
-        fragmentSizes.push_back(fragmentSize);
-        remaining -= fragmentSize;
-        totalWeight -= weights[i];
     }
-    return fragmentSizes;
+    return sizes;
 }
-vector<vector<uint8_t>> splitFile(const vector<uint8_t>& data,const vector<size_t>& sizes){
-    vector<vector<uint8_t>> fragments;
-    size_t position = 0;
-    for (size_t size : sizes){
-        if (position >= data.size())
-            break;
-        size_t remaining =
-            data.size() - position;
-        size_t actualSize =
-            min(size, remaining);
-        vector<uint8_t> fragment(data.begin() + position,data.begin() + position + actualSize);
-        fragments.push_back(fragment);
-        position += actualSize;
-    }
-    return fragments;
-}
-vector<uint8_t> mergeFragments(
-    const vector<vector<uint8_t>>& fragments){
-    vector<uint8_t> data;
-    for (const auto& fragment : fragments){
-        data.insert(
-            data.end(),
-            fragment.begin(),
-            fragment.end()
-        );
-    }
-    return data;
-}
-vector<vector<uint8_t>> shuffleFragment(const vector<vector<uint8_t>>& fragments, const vector<unsigned char>& key, vector<size_t>& order) {
-    size_t fragmentCount = fragments.size();
-    order.resize(fragmentCount);
-    vector<uint8_t> input;
 
-    for (size_t i = 0; i < fragmentCount; i++) {
-        order[i] = i;
-    }
-    if (fragmentCount < 2) return fragments;
-    for (size_t i = fragmentCount - 1; i > 0; i--) {
-        size_t j;
-        input.clear();
-        uint64_t index = i;
-        for (int b = 0; b < 8; b++){
-            input.push_back(index >> (b * 8) & 0xFF);
-        }
-        unsigned char digest[32];
-        hmac_sha256(key.data(), key.size(), input.data(), input.size(), digest,sizeof(digest));
-        uint64_t value = 0;
-        for(int b = 0; b < 8; b++){
-            value = (value << 8) | digest[b];
-        }
-        j = value % (i + 1);
-        swap(order[i], order[j]);
-    }
-    vector<vector<uint8_t>> shuffled;
-    shuffled.reserve(fragmentCount);
-    for(size_t i = 0; i < fragmentCount; i++){
-        shuffled.push_back(fragments[order[i]]);
-    }
-    return shuffled;
+std::vector<uint8_t> packf(const FileHeader& header, const std::vector<uint8_t>& payload, const std::vector<uint8_t>& key) {
+    std::vector<uint8_t> raw;
+    raw.resize(sizeof(FileHeader) + payload.size());
+    std::memcpy(raw.data(), &header, sizeof(FileHeader));
+    std::memcpy(raw.data() + sizeof(FileHeader), payload.data(), payload.size());
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    std::vector<uint8_t> encrypted(raw.size() + EVP_MAX_BLOCK_LENGTH + 16);
+    
+    uint8_t iv[16];
+    std::random_device rd;
+    for (int i = 0; i < 16; ++i) iv[i] = rd() & 0xFF;
+
+    std::memcpy(encrypted.data(), iv, 16);
+
+    int len = 0, ciphertext_len = 0;
+    EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key.data(), iv);
+    EVP_EncryptUpdate(ctx, encrypted.data() + 16, &len, raw.data(), raw.size());
+    ciphertext_len = len;
+    EVP_EncryptFinal_ex(ctx, encrypted.data() + 16 + len, &len);
+    ciphertext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+
+    encrypted.resize(16 + ciphertext_len);
+
+    uint8_t hmacVal[32];
+    unsigned int hmacLen = 32;
+    HMAC(EVP_sha256(), key.data(), key.size(), encrypted.data(), encrypted.size(), hmacVal, &hmacLen);
+
+    std::vector<uint8_t> sgtData(32 + encrypted.size());
+    std::memcpy(sgtData.data(), hmacVal, 32);
+    std::memcpy(sgtData.data() + 32, encrypted.data(), encrypted.size());
+
+    return sgtData;
 }
-struct FileHeader{
-    uint32_t index; uint32_t total; uint64_t sessionId;  uint64_t payloadSize;
-};
-vector<uint8_t> packf(const vector<uint8_t>& fragment, uint32_t index, uint32_t total, uint64_t sessionId, const vector <unsigned char>& key){
-    FileHeader header;
-    header.index = index;
-    header.total = total;
-    header.sessionId = sessionId;
-    header.payloadSize = fragment.size();
-    vector<uint8_t> protectedData;
-    const uint8_t* headerBytes = reinterpret_cast<const uint8_t*>(&header);
-    protectedData.insert(protectedData.end(), headerBytes, headerBytes + sizeof(header));
-    protectedData.insert(protectedData.end(), fragment.begin(), fragment.end());
-    apadd(protectedData);
-    aesEncrypt(protectedData, key);
-    uint8_t hmac[32];
-    hmac_sha256(key.data(), key.size(), protectedData.data(), protectedData.size(),hmac, sizeof(hmac));
-    protectedData.insert(protectedData.end(), hmac, hmac + 32);
-    return protectedData;
-}
-bool unpackf(const vector<uint8_t>& protectedData,const vector<unsigned char>& key,FileHeader& info,vector<uint8_t>& fragment){
-    if (protectedData.size() <= 32)
+
+bool unpackf(const std::vector<uint8_t>& sgtData, const std::vector<uint8_t>& key, DecryptedFragment& outFragment) {
+    if (sgtData.size() < 32 + 16 + sizeof(FileHeader)) return false;
+
+    const uint8_t* expectedHmac = sgtData.data();
+    const uint8_t* encryptedData = sgtData.data() + 32;
+    size_t encryptedLen = sgtData.size() - 32;
+
+    uint8_t calculatedHmac[32];
+    unsigned int hmacLen = 32;
+    HMAC(EVP_sha256(), key.data(), key.size(), encryptedData, encryptedLen, calculatedHmac, &hmacLen);
+
+    if (std::memcmp(expectedHmac, calculatedHmac, 32) != 0) {
         return false;
-    size_t encryptedSize = protectedData.size() - 32;
-    unsigned char expectedHmac[32];
-    hmac_sha256(key.data(),key.size(),protectedData.data(),encryptedSize,expectedHmac,sizeof(expectedHmac));
-    if (memcmp(expectedHmac,protectedData.data() + encryptedSize,32) != 0)
+    }
+
+    const uint8_t* iv = encryptedData;
+    const uint8_t* ciphertext = encryptedData + 16;
+    size_t ciphertextLen = encryptedLen - 16;
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    std::vector<uint8_t> decrypted(ciphertextLen + EVP_MAX_BLOCK_LENGTH);
+    int len = 0, plaintext_len = 0;
+
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key.data(), iv);
+    EVP_DecryptUpdate(ctx, decrypted.data(), &len, ciphertext, ciphertextLen);
+    plaintext_len = len;
+    
+    if (EVP_DecryptFinal_ex(ctx, decrypted.data() + len, &len) <= 0) {
+        EVP_CIPHER_CTX_free(ctx);
         return false;
-    vector<uint8_t> encrypted(protectedData.begin(),protectedData.begin() + encryptedSize);
-    aesDecrypt(encrypted, key);
-    if (encrypted.size() < sizeof(FileHeader))
-        return false;
-    memcpy(&info,encrypted.data(),sizeof(FileHeader));
-    if (info.payloadSize >encrypted.size() - sizeof(FileHeader))
-        return false;
-    fragment.assign(encrypted.begin() + sizeof(FileHeader),encrypted.begin() + sizeof(FileHeader) + info.payloadSize);
+    }
+    plaintext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+
+    decrypted.resize(plaintext_len);
+
+    if (decrypted.size() < sizeof(FileHeader)) return false;
+
+    std::memcpy(&outFragment.header, decrypted.data(), sizeof(FileHeader));
+    outFragment.payload.assign(decrypted.begin() + sizeof(FileHeader), decrypted.end());
+
     return true;
 }
-uint64_t createsessionId(){static random_device rd;static mt19937_64 eng(rd());return eng();
-}
-string randomFileName(){
-    static const char chars[] =
-        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    vector<string> extensions = {
-        ".sys", ".tmp", ".dat", ".dll",".log", ".cfg",
-         ".cache",".bin", ".bak", ".old","exe",".sgt",
-         ".mp3",".wav",".flac",".ogg",".m4a","aac",
-         ".wma",".alac",".aiff",".opus","midi",".mid",
-         ".aif",".aifc",".aiff",".au",".snd",".pcm",
-         ".raw",".voc",".cda",".m3u",".pls","asx",".wax",
-         ".wpl",".xspf",".m4b",".m4p",".m4r",".m4v",".3gp",
-         ".3g2",".mp4",".mov",".avi",".wmv",".flv",".mkv",
-          ".webm",".vob",".ogv",".ts",".mts",".m2ts",".divx",
-          ".xvid",".rm",".rmvb",".asf",".f4v",".swf",".mxf",
-          ".dv",".dvr-ms",".wtv",".yuv",".y4m","mjpeg",".mjpg",
-          ".m2v",".m1v",".mpg",".mpeg",".mp2",".mp3",".mpa",".mpe",
-          ".mpv",".m4v",".3gp2",".3gpp",".3gpp2",".3g2a",".3g2b",
-          ".3g2c",".3g2d",".3g2e",".3g2f",".3g2g",".3g2h",".3g2i",
-          ".3g2j",".3g2k",".3g2l",".3g2m",".3g2n",".3g2o",".3g2p",
-          ".3g2q",".3g2r",".3g2s",".3g2t",".3g2u",".3g2v",".3g2w",
-          ".3g2x",".3g2y",".3g2z","pmg",".pmp",".pmv",".pmt",".pmw",
-          ".pmx",".pmy",".pmz",".pna",".pnb",".pnc",".pnd",".pne",
-          ".pnf",".png",".pnm",".pno",".pnp",".pnq",".pnr",".pns",
-          ".pnt",".pnu",".pnv",".pnw",".pnx",".pny",".pnz"
-    };
-    string name;
-    for (int i = 0; i < 12; i++){
-        name += chars[rand() % (sizeof(chars) - 1)];
+
+bool executeProtectFlow(const std::string& inputPath, const std::string& audioPath, const std::string& outputDir, const std::string& password) {
+    if (!fs::exists(inputPath)) {
+        std::cerr << "{\"status\":\"error\",\"message\":\"File input khong ton tai\"}\n";
+        return false;
     }
-    string ext = extensions[rand() % extensions.size()];
-    return name + ext;
-}
-int main(){
-    string pass;
-    cout << "Nhap mat khau: ";
-    cin >> pass;
-    vector<unsigned char> key = generateHash(pass);
-    while (true){
-        cout << "\n========================\n";
-        cout << "      SENTINELGATE\n";
-        cout << "========================\n";
-        cout << "1. Ma hoa file\n";
-        cout << "2. Giai ma file\n";
-        cout << "0. Thoat\n";
-        cout << "Lua chon: ";
-        int choice;
-        cin >> choice;
-        cin.ignore();
-        switch (choice){
-            case 1:
-            {
-                string filePath;
-                string audioPath;
-                cout << "\nNhap duong dan FILE DU LIEU: ";
-                getline(cin, filePath);
-                cout << "Nhap duong dan FILE NHAC: ";
-                getline(cin, audioPath);
-                filePath.erase(remove(filePath.begin(), filePath.end(), '\"'), filePath.end());
-                audioPath.erase(remove(audioPath.begin(), audioPath.end(), '\"'), audioPath.end());
-                
-                vector<uint8_t> data = readFile(filePath);
-                if (data.empty())
-                    break;
-                    
-                if (!analyzeBeat(audioPath)) {
-                    cout << "Khong tao duoc Beat Map!\n";
-                    break;
-                }
-                
-                apadd(data);
-                vector<size_t> fragmentMap = createFragmentMap(data.size(), key);
-                if (fragmentMap.empty()) {
-                    cout << "Khong tao duoc Fragment Map!\n";
-                    break;
-                }
-                
-                cout << "\nFRAGMENT MAP\n";
-                for (size_t i = 0; i < fragmentMap.size(); i++) {
-                    cout << "M" << i << " = " << fragmentMap[i] << " bytes\n";
-                }
-                
-                vector<vector<uint8_t>> fragments = splitFile(data, fragmentMap);
-                cout << "\nSo fragment: " << fragments.size() << "\n";
-                
-                vector<vector<uint8_t>> protectedFragments;
-                protectedFragments.reserve(fragments.size());
-                uint64_t sessionId = createsessionId();
-                
-                for (size_t i = 0; i < fragments.size(); i++) {
-                    if (!fragments[i].empty()) {
-                        vector<uint8_t> result = packf(fragments[i], i, fragments.size(), sessionId, key);
-                        protectedFragments.push_back(result);
-                    }
-                }
-                
-                vector<size_t> order;
-                vector<vector<uint8_t>> shuffled = shuffleFragment(protectedFragments, key, order);
-                cout << "shuffle size: " << shuffled.size() << "\n";
-                string output = filePath + ".sgt";
-                filesystem::create_directories(output);
-                cout << "\nDanh sach cac file duoc tao:\n";
-                for (size_t i = 0; i < shuffled.size(); i++) {
-                    string randomName = randomFileName();
-                    string fragmentPath = output + "/" + randomName; 
-                    writeFile(fragmentPath, shuffled[i]);
-                    cout << randomName << "\n"; 
-                }
-                cout << "\ntest code\n";
-                
-                cout << "Output: " << output << "\n";
-                break;
-            }
-            case 2:
-            {
-             string path;
-            cout << "Nhap thu muc .sgt: ";
-            getline(cin, path);
 
-            path.erase(remove(path.begin(), path.end(), '\"'), path.end());
+    if (!fs::exists(outputDir)) {
+        fs::create_directories(outputDir);
+    }
 
-            if (!filesystem::exists(path) || !filesystem::is_directory(path)){
-                cout << "\nThu muc .sgt khong ton tai!\n";
-                break;
-            }
+    std::vector<uint8_t> rawData = readFile(inputPath);
+    if (rawData.empty()) {
+        std::cerr << "{\"status\":\"error\",\"message\":\"File input rong hoac khong the doc\"}\n";
+        return false;
+    }
 
-            vector<vector<uint8_t>> fragments;
-            vector<FileHeader> headers;
+    std::string originalHash = computeSHA256(rawData);
 
-            uint64_t sessionId = 0;
-            uint32_t total = 0;
+    std::vector<uint8_t> key = generateHash(password);
+    std::vector<double> beats = analyzeBeat(audioPath);
+    std::vector<size_t> fragSizes = createFragmentMap(rawData.size(), beats);
 
-            for (const auto& entry : filesystem::directory_iterator(path)){
-                if (!entry.is_regular_file())
-                    continue;
+    uint64_t sessionId = createsessionId();
+    uint32_t totalFrags = static_cast<uint32_t>(fragSizes.size());
 
-                vector<uint8_t> protectedData = readFile(entry.path().string());
+    size_t offset = 0;
+    std::vector<std::vector<uint8_t>> packedFiles;
 
-                if (protectedData.empty())
-                    continue;
+    for (uint32_t i = 0; i < totalFrags; ++i) {
+        size_t currentSize = fragSizes[i];
+        std::vector<uint8_t> payload(rawData.begin() + offset, rawData.begin() + offset + currentSize);
+        offset += currentSize;
 
-                FileHeader info;
-                vector<uint8_t> fragment;
+        FileHeader header;
+        header.index = i;
+        header.total = totalFrags;
+        header.sessionId = sessionId;
+        header.payloadSize = payload.size();
 
-                if (!unpackf(protectedData, key, info, fragment)){
-                    cout << "\nFragment loi hoac sai password: "
-                        << entry.path().filename().string()
-                        << "\n";
-                    continue;
-                }
+        std::vector<uint8_t> sgtBlock = packf(header, payload, key);
+        packedFiles.push_back(sgtBlock);
+    }
 
-                if (total == 0){
-                    total = info.total;
-                    sessionId = info.sessionId;
-                }
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(packedFiles.begin(), packedFiles.end(), g);
 
-                if (info.total != total || info.sessionId != sessionId){
-                    cout << "\nFragment khong cung session!\n";
-                    continue;
-                }
-
-                headers.push_back(info);
-                fragments.push_back(fragment);
-            }
-
-            if (fragments.empty()){
-                cout << "\nKhong tim thay fragment hop le!\n";
-                break;
-            }
-
-            if (fragments.size() != total){
-                cout << "\nThieu fragment!\n";
-                cout << "Tim thay: " << fragments.size()
-                    << "/" << total << "\n";
-                break;
-            }
-
-            vector<size_t> order(fragments.size());
-
-            for (size_t i = 0; i < fragments.size(); i++)
-                order[i] = i;
-
-            sort(order.begin(), order.end(), [&](size_t a, size_t b){
-                return headers[a].index < headers[b].index;
-            });
-
-            vector<vector<uint8_t>> sortedFragments;
-
-            for (size_t i : order)
-                sortedFragments.push_back(fragments[i]);
-
-            vector<uint8_t> restored = mergeFragments(sortedFragments);
-            rpadd(restored);
-            filesystem::path sgtPath(path);
-            string outputPath = sgtPath.replace_extension("").string();
-            writeFile(outputPath, restored);
-            cout << "\n================================\n";
-            cout << "       RESTORE THANH CONG\n";
-            cout << "================================\n";
-            cout << "So fragment: " << total << "\n";
-            cout << "Output1: " << outputPath << "\n";
-            break;
-            }     
-        case 0:
-            cout << "Thoat chuong trinh.\n";
-            return 0;
-        default:
-            cout << "Lua chon khong hop le. Vui long thu lai.\n";
-            break;          
+    for (const auto& block : packedFiles) {
+        std::string outPath = (fs::path(outputDir) / randomFileName()).string();
+        if (!writeFile(outPath, block)) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Khong the ghi fragment .sgt\"}\n";
+            return false;
         }
     }
+
+    std::cout << "{\"status\":\"success\",\"mode\":\"protect\",\"outputDir\":\"" << outputDir << "\",\"sha256\":\"" << originalHash << "\"}\n";
+    return true;
+}
+
+bool executeRestoreFlow(const std::string& inputDir, const std::string& outputFile, const std::string& password) {
+    if (!fs::exists(inputDir) || !fs::is_directory(inputDir)) {
+        std::cerr << "{\"status\":\"error\",\"message\":\"Thu muc .sgt khong ton tai\"}\n";
+        return false;
+    }
+
+    std::vector<uint8_t> key = generateHash(password);
+    std::vector<DecryptedFragment> decryptedList;
+
+    for (const auto& entry : fs::directory_iterator(inputDir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".sgt") {
+            std::vector<uint8_t> sgtData = readFile(entry.path().string());
+            DecryptedFragment frag;
+            frag.sourcePath = entry.path().string();
+
+            if (!unpackf(sgtData, key, frag)) {
+                std::cerr << "{\"status\":\"error\",\"message\":\"Xac thuc HMAC hoac Giai ma AES that bai. Mat khau sai hoac file .sgt bi loi/chinh sua.\"}\n";
+                return false;
+            }
+
+            if (frag.header.total == 0) {
+                std::cerr << "{\"status\":\"error\",\"message\":\"Header payload bi loi: total phai lon hon 0\"}\n";
+                return false;
+            }
+            if (frag.header.index >= frag.header.total) {
+                std::cerr << "{\"status\":\"error\",\"message\":\"Header index khong hop le\"}\n";
+                return false;
+            }
+            if (frag.header.payloadSize != static_cast<uint64_t>(frag.payload.size())) {
+                std::cerr << "{\"status\":\"error\",\"message\":\"Size payload giai ma khong khop voi header payloadSize\"}\n";
+                return false;
+            }
+
+            decryptedList.push_back(frag);
+        }
+    }
+
+    if (decryptedList.empty()) {
+        std::cerr << "{\"status\":\"error\",\"message\":\"Khong tim thay file .sgt nao trong thu muc\"}\n";
+        return false;
+    }
+
+    uint64_t expectedSessionId = decryptedList[0].header.sessionId;
+    uint32_t expectedTotal = decryptedList[0].header.total;
+
+    if (decryptedList.size() != expectedTotal) {
+        std::cerr << "{\"status\":\"error\",\"message\":\"So luong fragment khong du. Yeu cau: " 
+                  << expectedTotal << ", Thuc te: " << decryptedList.size() << "\"}\n";
+        return false;
+    }
+
+    std::vector<bool> indexCheck(expectedTotal, false);
+    uint64_t totalPayloadSize = 0;
+
+    for (const auto& frag : decryptedList) {
+        if (frag.header.sessionId != expectedSessionId) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Phat hien fragment khong cung Session ID\"}\n";
+            return false;
+        }
+        if (frag.header.total != expectedTotal) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Phat hien gia tri Total khong nhat quan\"}\n";
+            return false;
+        }
+        if (frag.header.index >= expectedTotal) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Index vuot qua pham vi Total\"}\n";
+            return false;
+        }
+        if (indexCheck[frag.header.index]) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Phat hien fragment trung Index: " << frag.header.index << "\"}\n";
+            return false;
+        }
+        indexCheck[frag.header.index] = true;
+
+        if (totalPayloadSize > std::numeric_limits<uint64_t>::max() - frag.header.payloadSize) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Phat hien tran bo nho (overflow) khi tinh tong dung luong file\"}\n";
+            return false;
+        }
+        totalPayloadSize += frag.header.payloadSize;
+    }
+
+    for (uint32_t i = 0; i < expectedTotal; ++i) {
+        if (!indexCheck[i]) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Thieu fragment tai index: " << i << "\"}\n";
+            return false;
+        }
+    }
+
+    std::sort(decryptedList.begin(), decryptedList.end(), [](const DecryptedFragment& a, const DecryptedFragment& b) {
+        return a.header.index < b.header.index;
+    });
+
+    std::vector<uint8_t> finalFileBytes;
+    finalFileBytes.reserve(totalPayloadSize);
+    for (const auto& frag : decryptedList) {
+        finalFileBytes.insert(finalFileBytes.end(), frag.payload.begin(), frag.payload.end());
+    }
+
+    if (!writeFile(outputFile, finalFileBytes)) {
+        std::cerr << "{\"status\":\"error\",\"message\":\"Khong the ghi file khoi phuc\"}\n";
+        return false;
+    }
+
+    std::string restoredHash = computeSHA256(finalFileBytes);
+    std::cout << "{\"status\":\"success\",\"mode\":\"restore\",\"outputFile\":\"" << outputFile << "\",\"sha256\":\"" << restoredHash << "\"}\n";
+    return true;
+}
+
+int main(int argc, char* argv[]) {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(NULL);
+
+    if (argc < 2) {
+        std::cerr << "{\"status\":\"error\",\"message\":\"Thieu che do thuc thi (protect hoac restore)\"}\n";
+        return 1;
+    }
+
+    std::string mode = argv[1];
+
+    if (mode == "protect") {
+        if (argc < 5) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Cu phap: ./sentinelgate protect <input> <audio> <output_dir>\"}\n";
+            return 1;
+        }
+
+        std::string inputPath = argv[2];
+        std::string audioPath = argv[3];
+        std::string outputDir = argv[4];
+
+        std::string password;
+        if (!std::getline(std::cin, password) || password.empty()) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Khong nhan duoc password tu STDIN\"}\n";
+            return 1;
+        }
+
+        if (executeProtectFlow(inputPath, audioPath, outputDir, password)) {
+            return 0;
+        } else {
+            return 1;
+        }
+
+    } else if (mode == "restore") {
+        if (argc < 4) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Cu phap: ./sentinelgate restore <fragment_dir> <output_file>\"}\n";
+            return 1;
+        }
+
+        std::string inputDir = argv[2];
+        std::string outputFile = argv[3];
+
+        std::string password;
+        if (!std::getline(std::cin, password) || password.empty()) {
+            std::cerr << "{\"status\":\"error\",\"message\":\"Khong nhan duoc password tu STDIN\"}\n";
+            return 1;
+        }
+
+        if (executeRestoreFlow(inputDir, outputFile, password)) {
+            return 0;
+        } else {
+            return 1;
+        }
+
+    } else {
+        std::cerr << "{\"status\":\"error\",\"message\":\"Che do khong hop le: " << mode << "\"}\n";
+        return 1;
+    }
+
     return 0;
-} 
+}
