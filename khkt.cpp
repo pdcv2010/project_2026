@@ -62,11 +62,23 @@ std::string randomFileName() {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> dis(0, sizeof(alphabet) - 2);
-    std::string name = "";
+
+    std::string name;
     for (int i = 0; i < 16; ++i) {
         name += alphabet[dis(gen)];
     }
-    return name + ".sgt";
+
+    static const char extensions[] = "abcdefghijklmnopqrstuvwxyz";
+    std::uniform_int_distribution<> extLenDis(3, 5);
+    std::uniform_int_distribution<> extDis(0, sizeof(extensions) - 2);
+
+    int extLen = extLenDis(gen);
+    std::string extension;
+    for (int i = 0; i < extLen; ++i) {
+        extension += extensions[extDis(gen)];
+    }
+
+    return name + "." + extension;
 }
 
 std::vector<uint8_t> readFile(const std::string& path) {
